@@ -1,5 +1,5 @@
 /**
- * CodeAlpha AI Assistant - Modern Interactive Client
+ * AI Assistant - Modern Interactive Client
  * Features:
  * - Multi-turn conversation memory
  * - Markdown & code syntax formatting via marked + DOMPurify
@@ -26,6 +26,11 @@ const statusText = document.getElementById("statusText");
 const welcomeCard = document.getElementById("welcomeCard");
 
 // Application State
+let sessionId = localStorage.getItem("chat_session_id");
+if (!sessionId) {
+  sessionId = "sess_" + Math.random().toString(36).substring(2, 11) + "_" + Date.now();
+  localStorage.setItem("chat_session_id", sessionId);
+}
 let conversationHistory = []; // Stores { role: "user" | "assistant", content: string }
 let isProcessing = false;
 let recognition = null;
@@ -35,7 +40,7 @@ let isListening = false;
 // 1. Theme Management (Dark / Light)
 // ============================================================
 function initTheme() {
-  const savedTheme = localStorage.getItem("codealpha_theme") || "dark";
+  const savedTheme = localStorage.getItem("chat_theme") || "dark";
   document.documentElement.setAttribute("data-theme", savedTheme);
 }
 
@@ -43,7 +48,7 @@ themeToggleBtn.addEventListener("click", () => {
   const currentTheme = document.documentElement.getAttribute("data-theme") || "dark";
   const newTheme = currentTheme === "dark" ? "light" : "dark";
   document.documentElement.setAttribute("data-theme", newTheme);
-  localStorage.setItem("codealpha_theme", newTheme);
+  localStorage.setItem("chat_theme", newTheme);
 });
 
 // ============================================================
@@ -53,9 +58,15 @@ async function checkHealth() {
   try {
     const res = await fetch("/health");
     if (res.ok) {
+      const data = await res.json();
       statusDot.className = "status-indicator online";
-      statusDot.title = "Connected to Flask Backend";
-      statusText.textContent = "Dual-Engine • Online";
+      if (data.database === "connected") {
+        statusDot.title = "Connected to Flask Backend & MongoDB Atlas Cloud DB";
+        statusText.textContent = "Dual-Engine • Cloud DB Active";
+      } else {
+        statusDot.title = "Connected to Flask Backend";
+        statusText.textContent = "Dual-Engine • Online";
+      }
     } else {
       throw new Error("Bad status");
     }
@@ -153,7 +164,7 @@ function appendMessage(text, sender, source = null) {
       badge.title = "Pattern-matched zero latency answer";
     } else if (source === "ai") {
       badge.className = "source-badge ai";
-      badge.innerHTML = "🤖 OpenRouter AI";
+      badge.innerHTML = "🤖 AI";
       badge.title = "Generative LLM answer";
     } else if (source === "warning" || source === "error") {
       badge.className = "source-badge";
@@ -268,6 +279,7 @@ async function sendMessage(textToSend = null) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message: text,
+        session_id: sessionId,
         // Send last 6 turns as conversation context
         history: conversationHistory.slice(-6),
       }),
@@ -346,6 +358,8 @@ clearBtn.addEventListener("click", () => {
   if (conversationHistory.length === 0) return;
   if (confirm("Are you sure you want to clear this conversation?")) {
     conversationHistory = [];
+    sessionId = "sess_" + Math.random().toString(36).substring(2, 11) + "_" + Date.now();
+    localStorage.setItem("chat_session_id", sessionId);
     // Remove all message rows except welcome card
     const rows = chatWindow.querySelectorAll(".message-row");
     rows.forEach((r) => r.remove());
@@ -364,13 +378,12 @@ exportBtn.addEventListener("click", () => {
     return;
   }
 
-  let exportText = "=== CodeAlpha AI Assistant Conversation ===\n";
+  let exportText = "=== AI Assistant Conversation ===\n";
   exportText += `Date: ${new Date().toLocaleString()}\n`;
-  exportText += `Domain: Cloud Computing Internship (Task 4)\n`;
   exportText += "===========================================\n\n";
 
   conversationHistory.forEach((item) => {
-    const speaker = item.role === "user" ? "You" : "CodeAlpha Assistant";
+    const speaker = item.role === "user" ? "You" : "AI Assistant";
     exportText += `[${speaker}]:\n${item.content}\n\n`;
   });
 
@@ -378,7 +391,7 @@ exportBtn.addEventListener("click", () => {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `CodeAlpha_Chat_${new Date().toISOString().slice(0, 10)}.txt`;
+  a.download = `Chat_${new Date().toISOString().slice(0, 10)}.txt`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
