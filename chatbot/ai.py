@@ -1,273 +1,626 @@
 """
-Generative AI layer with multi-provider support:
-- Groq (https://api.groq.com/openai/v1) -> Fast inference (Compound-mini, Qwen, etc.)
-- OpenRouter (https://openrouter.ai/api/v1) -> Mistral 7B free, Llama, Gemma, etc.
-- Mistral AI (https://api.mistral.ai/v1) -> Official open-mistral-7b
-- Grok / xAI (https://api.x.ai/v1) -> grok-2-latest, grok-beta
+AI layer for the CodeAlpha Chatbot.
 
-Auto-detects provider based on API key prefix or explicit configuration.
+Provider:
+    Google Gemini
+
+SDK:
+    google-genai
+
+Environment variables:
+    GEMINI_API_KEY
+    GEMINI_MODEL
+
+Default model:
+    gemini-3.5-flash-lite
 """
 
 import os
-from openai import OpenAI
+from typing import Optional
 
-_client = None
-_detected_provider = None
-_active_model = None
-
-SYSTEM_PROMPT = (
-    "You are a helpful, friendly AI Assistant. "
-    "You provide clear, structured answers to general questions, technical topics, "
-    "coding help, and everyday queries.\n\n"
-    "Guidelines:\n"
-    "- Format responses in clean Markdown (use **bolding**, lists, and `code` snippets where appropriate).\n"
-    "- Keep explanations concise (2 to 5 sentences or short bullet points), readable, and polite.\n"
-    "- If a query is ambiguous, give a brief helpful answer and suggest how they can proceed."
-)
-
-# Which env var(s) hold the key for each provider, in the order they should be checked.
-PROVIDER_KEY_ENV = {
-    "groq": ("GROQ_API_KEY",),
-    "openrouter": ("OPENROUTER_API_KEY",),
-    "mistral": ("MISTRAL_API_KEY",),
-    "grok": ("GROK_API_KEY", "XAI_API_KEY"),
-}
-
-PROVIDER_CONFIGS = {
-    "groq": {
-        "name": "Groq",
-        "base_url": "https://api.groq.com/openai/v1",
-        "default_model": "groq/compound-mini",
-        "fallbacks": ["groq/compound-mini", "qwen/qwen3.8-27b", "openai/gpt-oss-120b"],
-    },
-    "openrouter": {
-        "name": "OpenRouter",
-        "base_url": "https://openrouter.ai/api/v1",
-        "default_model": "mistralai/mistral-7b-instruct:free",
-        "fallbacks": [
-            "mistralai/mistral-7b-instruct:free",
-            "mistralai/mistral-7b-instruct",
-            "google/gemma-2-9b-it:free",
-            "qwen/qwen-2.5-7b-instruct:free",
-        ],
-    },
-    "mistral": {
-        "name": "Mistral AI",
-        "base_url": "https://api.mistral.ai/v1",
-        "default_model": "open-mistral-7b",
-        "fallbacks": ["open-mistral-7b", "mistral-small-latest"],
-    },
-    "grok": {
-        "name": "xAI Grok",
-        "base_url": "https://api.x.ai/v1",
-        "default_model": "grok-2-latest",
-        "fallbacks": ["grok-2-latest", "grok-beta"],
-    },
-}
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 
-def _clean_key(val):
-    """Strips whitespace and accidental surrounding quotes some .env parsers leave in."""
-    if val is None:
+# ============================================================
+# Load environment variables
+# ============================================================
+
+load_dotenv()
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+PROVIDER = "gemini"
+
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GEMINI_MODEL_ENV = "GEMINI_MODEL"
+
+
+# ============================================================
+# System prompt
+# ============================================================
+
+SYSTEM_PROMPT = """
+You are a helpful, friendly, and intelligent AI assistant.
+
+Your job is to help users with:
+- General questions
+- Programming and coding
+- Artificial Intelligence
+- Machine Learning
+- Data Science
+- Web development
+- College projects
+- Technical concepts
+- Everyday questions
+
+Response guidelines:
+1. Give accurate and useful answers.
+2. Keep answers clear and easy to understand.
+3. Use Markdown formatting when useful.
+4. Use bullet points for lists.
+5. Use code blocks for programming code.
+6. Explain technical topics step-by-step when necessary.
+7. Do not unnecessarily repeat the user's question.
+8. If the user asks for code, provide complete working code whenever possible.
+9. If something is unclear, make a reasonable assumption and state it briefly.
+10. Be friendly and professional.
+"""
+
+
+# ============================================================
+# Global client state
+# ============================================================
+
+_client: Optional[genai.Client] = None
+_cached_api_key: Optional[str] = None
+_active_model: Optional[str] = None
+
+
+# ============================================================
+# Utility functions
+# ============================================================
+
+def _clean_value(value):
+    """
+    Clean an environment variable value.
+
+    Removes:
+    - Leading/trailing spaces
+    - Accidental surrounding quotes
+    """
+
+    if value is None:
         return None
-    val = val.strip()
-    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-        val = val[1:-1].strip()
-    return val or None
+
+    value = str(value).strip()
+
+    if len(value) >= 2:
+        if value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1].strip()
+
+    return value or None
 
 
-def _key_for_provider(provider):
-    """Looks up a provider's own key env var(s) only - never another provider's."""
-    for env_name in PROVIDER_KEY_ENV.get(provider, ()):
-        val = _clean_key(os.environ.get(env_name))
-        if val:
-            return val
-    return None
+def _get_api_key():
+    """Return the Gemini API key from the environment."""
+
+    return _clean_value(
+        os.getenv(GEMINI_API_KEY_ENV)
+    )
 
 
-def _detect_provider_from_key(key):
-    if not key:
-        return None
-    if key.startswith("gsk_"):
-        return "groq"
-    if key.startswith("sk-or-"):
-        return "openrouter"
-    if key.startswith("xai-"):
-        return "grok"
-    return None
+def _get_model():
+    """Return the configured Gemini model."""
 
+    model = _clean_value(
+        os.getenv(GEMINI_MODEL_ENV)
+    )
+
+    return model or DEFAULT_MODEL
+
+
+# ============================================================
+# Configuration debugging
+# ============================================================
 
 def resolve_config():
     """
-    Determines provider, base_url, api_key, and models based on environment variables.
+    Resolve the current Gemini configuration.
 
-    Provider and API key are resolved together with key-prefix auto-detection so a key
-    never gets sent to the wrong provider's endpoint (e.g. a Groq gsk_ key being used
-    against openrouter.ai).
+    Returns:
+        provider, model, api_key, error
     """
-    explicit_provider = os.environ.get("AI_PROVIDER", "").strip().lower()
-    base_url = os.environ.get("AI_BASE_URL", "").strip()
-    custom_model = os.environ.get("AI_MODEL") or os.environ.get("OPENROUTER_MODEL")
-    generic_key = _clean_key(os.environ.get("AI_API_KEY"))
 
-    provider = None
-    api_key = None
-
-    if explicit_provider:
-        if explicit_provider not in PROVIDER_CONFIGS:
-            return None, None, None, [], (
-                f"Unknown AI_PROVIDER '{explicit_provider}'. Choose one of: "
-                f"{', '.join(PROVIDER_CONFIGS)}."
-            )
-        api_key = _key_for_provider(explicit_provider) or generic_key
-        # If no key found for explicit provider, check other env vars before giving up
-        if not api_key:
-            for cand in ("groq", "openrouter", "mistral", "grok"):
-                k = _key_for_provider(cand)
-                if k:
-                    api_key = k
-                    break
-
-        # Check if the key's prefix indicates a different provider (e.g. gsk_ with openrouter)
-        sniffed = _detect_provider_from_key(api_key)
-        if sniffed and sniffed != explicit_provider:
-            provider = sniffed
-        else:
-            provider = explicit_provider
-
-        if not api_key:
-            env_hint = " or ".join(PROVIDER_KEY_ENV[explicit_provider])
-            return None, None, None, [], (
-                f"AI_PROVIDER is set to '{explicit_provider}' but no matching key was found. "
-                f"Set {env_hint} (or AI_API_KEY) in .env."
-            )
-    else:
-        # 1. Prefer a provider-specific key, checked in priority order.
-        for candidate in ("groq", "openrouter", "mistral", "grok"):
-            key = _key_for_provider(candidate)
-            if key:
-                # Validate if the key prefix points to another provider
-                sniffed = _detect_provider_from_key(key)
-                provider = sniffed if sniffed else candidate
-                api_key = key
-                break
-
-        # 2. Fall back to a generic key, sniffing its prefix to guess the provider.
-        if not provider and generic_key:
-            provider = _detect_provider_from_key(generic_key) or "groq"
-            api_key = generic_key
+    api_key = _get_api_key()
+    model = _get_model()
 
     if not api_key:
-        return None, None, None, [], (
-            "No API key configured. Set GROQ_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY, "
-            "GROK_API_KEY/XAI_API_KEY, or a generic AI_API_KEY in .env."
+        return (
+            None,
+            None,
+            None,
+            (
+                "No Gemini API key configured. "
+                "Set GEMINI_API_KEY in your .env file."
+            ),
         )
 
-    conf = PROVIDER_CONFIGS.get(provider, PROVIDER_CONFIGS["groq"])
-    target_base_url = base_url or conf["base_url"]
-
-    # 3. Determine models
-    models_to_try = []
-    if custom_model:
-        # Handle shorthand alias like 'mistral-7b' -> full slug on openrouter
-        if provider == "openrouter" and custom_model in ("mistral-7b", "mistral-7b-instruct"):
-            custom_model = "mistralai/mistral-7b-instruct:free"
-        models_to_try.append(custom_model)
-
-    for m in conf["fallbacks"]:
-        if m not in models_to_try:
-            models_to_try.append(m)
-
-    return provider, target_base_url, api_key, models_to_try, None
+    return (
+        PROVIDER,
+        model,
+        api_key,
+        None,
+    )
 
 
 def debug_config():
     """
-    Returns a human-readable, secret-safe summary of what resolve_config() picked.
-    Call this manually (e.g. `python -c "import ai; print(ai.debug_config())"`)
-    to check which provider/key/model the app will actually use, without ever
-    printing the real key.
+    Return a safe configuration summary.
+
+    The actual API key is never printed.
     """
-    provider, base_url, api_key, models, err = resolve_config()
-    if err:
-        return f"[ai.debug_config] ERROR: {err}"
-    masked = f"{api_key[:4]}...{api_key[-4:]}" if api_key and len(api_key) > 8 else "(too short to mask safely)"
+
+    provider, model, api_key, error = resolve_config()
+
+    if error:
+        return f"[ai.debug_config] ERROR: {error}"
+
+    if len(api_key) >= 8:
+        masked_key = (
+            f"{api_key[:4]}..."
+            f"{api_key[-4:]}"
+        )
+    else:
+        masked_key = "(hidden)"
+
     return (
-        f"[ai.debug_config] provider={provider} base_url={base_url} "
-        f"key={masked} (len={len(api_key) if api_key else 0}) "
-        f"models={models}"
+        "[ai.debug_config] "
+        f"provider={provider} "
+        f"model={model} "
+        f"key={masked_key} "
+        f"(len={len(api_key)})"
     )
 
 
-_cached_key = None
-_cached_base_url = None
+# ============================================================
+# Gemini client
+# ============================================================
 
-def _get_client_and_models():
-    global _client, _detected_provider, _active_model, _cached_key, _cached_base_url
+def _get_client():
+    """
+    Create or reuse the Gemini API client.
 
-    provider, base_url, api_key, models, err = resolve_config()
-    if err:
-        raise RuntimeError(err)
+    The client is recreated automatically if the API key changes.
+    """
 
-    if _client is None or _detected_provider != provider or _cached_key != api_key or _cached_base_url != base_url:
-        _client = OpenAI(
-            base_url=base_url,
-            api_key=api_key,
+    global _client
+    global _cached_api_key
+
+    api_key = _get_api_key()
+
+    if not api_key:
+        raise RuntimeError(
+            "No Gemini API key configured. "
+            "Set GEMINI_API_KEY in your .env file."
         )
-        _detected_provider = provider
-        _cached_key = api_key
-        _cached_base_url = base_url
-        _active_model = models[0] if models else "default"
 
-    return _client, provider, models
+    if (
+        _client is None
+        or _cached_api_key != api_key
+    ):
+        _client = genai.Client(
+            api_key=api_key
+        )
+
+        _cached_api_key = api_key
+
+    return _client
 
 
-def get_ai_response(user_message: str, history: list = None) -> str:
+# ============================================================
+# Conversation history
+# ============================================================
+
+def _build_conversation(
+    user_message: str,
+    history: Optional[list] = None,
+):
     """
-    Sends the user message along with recent conversation history to the active AI provider.
-    Tries the primary model and falls back if rate-limited or busy.
+    Build a compact conversation prompt.
+
+    Only recent messages are included to avoid unnecessarily
+    large requests.
     """
-    client, provider, models = _get_client_and_models()
 
-    extra_headers = {}
-    site_url = os.environ.get("SITE_URL", "http://localhost:5000")
-    site_name = os.environ.get("SITE_NAME", "AI Assistant")
-    if provider == "openrouter":
-        if site_url:
-            extra_headers["HTTP-Referer"] = site_url
-        if site_name:
-            extra_headers["X-Title"] = site_name
+    conversation = []
 
-    # Assemble message context with recent history (up to last 6 turns)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if isinstance(history, list):
 
-    if history and isinstance(history, list):
-        for item in history[-6:]:
+        # Keep only the latest 8 messages.
+        recent_history = history[-8:]
+
+        for item in recent_history:
+
+            if not isinstance(item, dict):
+                continue
+
             role = item.get("role")
             content = item.get("content")
-            if role in ("user", "assistant") and isinstance(content, str) and content.strip():
-                messages.append({"role": role, "content": content.strip()[:600]})
 
-    messages.append({"role": "user", "content": user_message})
+            if role not in (
+                "user",
+                "assistant",
+            ):
+                continue
 
-    last_error = None
-    for model in models:
-        try:
-            completion = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.6,
-                max_tokens=450,
-                extra_headers=extra_headers or None,
+            if not isinstance(content, str):
+                continue
+
+            content = content.strip()
+
+            if not content:
+                continue
+
+            # Prevent huge history messages.
+            content = content[:1500]
+
+            if role == "user":
+                label = "User"
+            else:
+                label = "Assistant"
+
+            conversation.append(
+                f"{label}: {content}"
             )
-            reply = completion.choices[0].message.content
-            if reply and reply.strip():
-                return reply.strip()
-        except Exception as err:
-            last_error = err
+
+    # Current user message.
+    conversation.append(
+        f"User: {user_message[:5000]}"
+    )
+
+    conversation.append(
+        "Assistant:"
+    )
+
+    return "\n".join(conversation)
+
+
+# ============================================================
+# Response extraction
+# ============================================================
+
+def _extract_text(response):
+    """
+    Safely extract generated text from a Gemini response.
+
+    Gemini may return an empty response in cases such as:
+    - Safety blocking
+    - Empty candidates
+    - Unexpected response structure
+    """
+
+    if response is None:
+        return ""
+
+    # --------------------------------------------------------
+    # Normal response.text
+    # --------------------------------------------------------
+
+    try:
+        text = response.text
+    except Exception:
+        text = None
+
+    if isinstance(text, str):
+
+        text = text.strip()
+
+        if text:
+            return text
+
+    # --------------------------------------------------------
+    # Fallback: inspect candidates
+    # --------------------------------------------------------
+
+    try:
+        candidates = response.candidates
+    except Exception:
+        candidates = None
+
+    if not candidates:
+        return ""
+
+    collected = []
+
+    for candidate in candidates:
+
+        try:
+            content = candidate.content
+        except Exception:
+            content = None
+
+        if not content:
             continue
 
-    if last_error:
-        raise last_error
+        try:
+            parts = content.parts
+        except Exception:
+            parts = None
 
-    return "I'm having a brief issue reaching the AI backend. Please try asking again in a moment."
+        if not parts:
+            continue
+
+        for part in parts:
+
+            try:
+                part_text = part.text
+            except Exception:
+                part_text = None
+
+            if (
+                isinstance(part_text, str)
+                and part_text.strip()
+            ):
+                collected.append(
+                    part_text.strip()
+                )
+
+    return "\n".join(collected).strip()
+
+
+# ============================================================
+# Finish reason
+# ============================================================
+
+def _get_finish_reason(response):
+    """Safely obtain Gemini's finish reason."""
+
+    try:
+        candidates = response.candidates
+
+        if candidates:
+            return str(
+                candidates[0].finish_reason
+            )
+
+    except Exception:
+        pass
+
+    return "UNKNOWN"
+
+
+# ============================================================
+# Main AI function
+# ============================================================
+
+def get_ai_response(
+    user_message: str,
+    history: Optional[list] = None,
+) -> str:
+    """
+    Generate an AI response using Google Gemini.
+
+    This function keeps the same interface expected by
+    app.py:
+
+        get_ai_response(user_message, history=history)
+    """
+
+    global _active_model
+
+    # --------------------------------------------------------
+    # Validate input
+    # --------------------------------------------------------
+
+    if not isinstance(user_message, str):
+        raise ValueError(
+            "user_message must be a string."
+        )
+
+    user_message = user_message.strip()
+
+    if not user_message:
+        return "Please enter a message."
+
+    # --------------------------------------------------------
+    # Get Gemini client
+    # --------------------------------------------------------
+
+    client = _get_client()
+
+    model = _get_model()
+
+    # --------------------------------------------------------
+    # Build conversation
+    # --------------------------------------------------------
+
+    conversation = _build_conversation(
+        user_message=user_message,
+        history=history,
+    )
+
+    # --------------------------------------------------------
+    # Gemini request
+    # --------------------------------------------------------
+
+    try:
+
+        response = client.models.generate_content(
+            model=model,
+            contents=conversation,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                max_output_tokens=800,
+                candidate_count=1,
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Extract response
+        # ----------------------------------------------------
+
+        reply = _extract_text(response)
+
+        if reply:
+
+            _active_model = model
+
+            print(
+                "[AI] Gemini response successful "
+                f"| model={model}"
+            )
+
+            return reply
+
+        # ----------------------------------------------------
+        # Empty response
+        # ----------------------------------------------------
+
+        finish_reason = _get_finish_reason(
+            response
+        )
+
+        raise RuntimeError(
+            "Gemini returned no text content. "
+            f"Finish reason: {finish_reason}"
+        )
+
+    # --------------------------------------------------------
+    # Known runtime errors
+    # --------------------------------------------------------
+
+    except RuntimeError:
+        raise
+
+    # --------------------------------------------------------
+    # API / network / SDK errors
+    # --------------------------------------------------------
+
+    except Exception as error:
+
+        error_text = str(error)
+
+        print(
+            "[AI ERROR] "
+            f"Gemini request failed: {error_text}"
+        )
+
+        # ----------------------------------------------------
+        # Authentication
+        # ----------------------------------------------------
+
+        if (
+            "401" in error_text
+            or "Unauthorized" in error_text
+            or "API key" in error_text
+            and "invalid" in error_text.lower()
+        ):
+            raise RuntimeError(
+                "Gemini API authentication failed. "
+                "Please check your GEMINI_API_KEY."
+            ) from error
+
+        # ----------------------------------------------------
+        # Rate limit / quota
+        # ----------------------------------------------------
+
+        if (
+            "429" in error_text
+            or "RESOURCE_EXHAUSTED" in error_text
+            or "quota" in error_text.lower()
+            or "rate limit" in error_text.lower()
+        ):
+            raise RuntimeError(
+                "Gemini API rate limit or quota exceeded. "
+                "Please wait and try again."
+            ) from error
+
+        # ----------------------------------------------------
+        # Connection problems
+        # ----------------------------------------------------
+
+        if (
+            "timeout" in error_text.lower()
+            or "timed out" in error_text.lower()
+            or "connection" in error_text.lower()
+        ):
+            raise RuntimeError(
+                "Unable to connect to the Gemini API. "
+                "Please check your internet connection "
+                "and try again."
+            ) from error
+
+        # ----------------------------------------------------
+        # Generic error
+        # ----------------------------------------------------
+
+        raise RuntimeError(
+            f"Gemini API request failed: {error_text}"
+        ) from error
+
+
+# ============================================================
+# Simple health check
+# ============================================================
+
+def test_gemini():
+    """
+    Send a tiny request to verify Gemini connectivity.
+
+    Returns:
+        True if Gemini responds successfully.
+    """
+
+    try:
+
+        response = get_ai_response(
+            "Reply with exactly: Gemini connection successful."
+        )
+
+        if response:
+            print(
+                "[AI TEST] Gemini connection successful."
+            )
+
+            return True
+
+    except Exception as error:
+
+        print(
+            f"[AI TEST] Gemini connection failed: {error}"
+        )
+
+    return False
+
+
+# ============================================================
+# Module test
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("=" * 60)
+    print("CodeAlpha Chatbot - Gemini AI Test")
+    print("=" * 60)
+
+    print(
+        debug_config()
+    )
+
+    print()
+
+    if test_gemini():
+        print(
+            "Status: SUCCESS"
+        )
+    else:
+        print(
+            "Status: FAILED"
+        )
